@@ -1,0 +1,7 @@
+*.pdf 
+*.json
+*.pyc
+.vscode
+*.tar.gz
+*.log
+results
