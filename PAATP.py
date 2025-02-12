@@ -31,8 +31,9 @@ class PingPongFlow(Flow):
     ACEN_PKT_TYPE = 'ACEN'
 
     PING_PKT_SIZE_IN_BITS = 2
-    PONG_PKT_SIZE_IN_BITS = int(1.2 * 8e3)
+    PONG_PKT_SIZE_IN_BITS = 8 * 1024
     CWD_PKT_SIZE_IN_BITS = 2
+    ACEN_PKT_SIZE_IN_BITS = PONG_PKT_SIZE_IN_BITS
 
     DUPLICATED_PONG_THRESHOLD = 3
 
@@ -42,15 +43,15 @@ class PingPongFlow(Flow):
 
         self.rate_bps = self.params.get('nic_rate_bps', 2e8)
         #self.sending_interval_var = 0.2
-        self.cwnd = self.params.get('init_cwnd', 1)
-        self.awd = self.params.get('awd', 6)
+        self.cwnd = self.params.get('init_cwnd', 5)
+        self.awd = self.params.get('awd', 15)
         self.snd_nxt = min(self.cwnd, self.awd)
         self.min_cwnd = self.params.get('min_cwnd', 1)
         self.max_cwnd = self.params.get('max_cwnd', math.inf)
         self.cc_state = self.CC_STATE_SLOW_START
         self.ssthresh = None
 
-        self.chunk_seq = 0
+        self.chunk_seq = 1
         self.ping_seq = 0
         self.pong_seq = 0
         self.relocated_chunk_seq = -1
@@ -62,6 +63,7 @@ class PingPongFlow(Flow):
         self.received_ping = 0
         self.received_pong = 0
         self.received_cwd = 0
+        self.send_times = {}
 
         #用于PAATP
         self.sent_pkt_rtt = 0   #rtt send ecn
@@ -70,8 +72,8 @@ class PingPongFlow(Flow):
         self.received_pkt_ecn_rtt = 0 #rtt支持ecn
         self.received_pkt_rtt = 0 #rtt
 
-        self.last_pong_received_seq = -1#last_AACK
-        self.last_cwd_received_seq = -1#last_GACK
+        self.last_pong_received_seq = 0#last_AACK
+        self.last_cwd_received_seq = 0#last_GACK
      
         self.cwd_alpha = 0
         self.awd_beta = 0   #初始值应该设置为多少？
@@ -87,11 +89,12 @@ class PingPongFlow(Flow):
 
         self.resend_queue = OrderedDict()
 
-        self.chunk_to_send = OrderedDict()
-        for i in range(self.total_chunk_num):
-            self.chunk_to_send[i] = 1
-
-
+        if self.total_chunk_num <= 1:
+            print("Warning: total_chunk_num is less than or equal to 1. No chunks to send.")
+        else:
+            self.chunk_to_send = OrderedDict()
+            for i in range(1, self.total_chunk_num):
+                self.chunk_to_send[i] = 1
         self.completed_chunks = {}
         self.completed_chunk_offset = 0
 
@@ -108,7 +111,7 @@ class PingPongFlow(Flow):
 
         self.last_pong_received_time = None
 
-        self.pong_timeout_threshold = self.params.get('timeout_threshold', 1)
+        self.pong_timeout_threshold = self.params.get('timeout_threshold', 100)
 
         events = []
         if self.total_chunk_num != 0:
@@ -158,6 +161,7 @@ class PingPongFlow(Flow):
             self.cc_state = self.CC_STATE_SLOW_START
             self.ssthresh = max(1., self.cwnd * .5)
             self.update_cwnd(1)
+            self.gen_stat()
             self.last_ssthresh_update_time = cur_time
             for i in self.ping_yet_unpong:
                 self.resend_queue[i] = 1
@@ -185,7 +189,7 @@ class PingPongFlow(Flow):
 
         self.sent_pkt_rtt += 1
 
-
+        self.send_times[chunk_seq] = cur_time
 
         self.sent_ping += 1
 
@@ -195,8 +199,6 @@ class PingPongFlow(Flow):
         obj = pkt.get_next_hop()#其实是获得当前节点而不是next_hop
         #delay = random.random() * 0.05 * self.get_sending_interval()
         e = Event(cur_time + delay, obj, 'on_pkt_received', params=dict(pkt=pkt))
-
-        print('#szx sent ping', pkt)
         return e, pkt
 
     def on_ping_sent(self):
@@ -209,10 +211,12 @@ class PingPongFlow(Flow):
 
         if self.can_send_ping() and len(self.ping_yet_unpong) < self.cwnd :
             if len(self.resend_queue) > 0:
+               
                 chunk_seq, _ = self.resend_queue.popitem(last=False)
                 print('$ debug, resend chunk_seq', chunk_seq)
-            elif len(self.chunk_to_send) > 0 and self.ping_seq < self.snd_nxt:
-                #print('debug---xx', self.chunk_seq)
+            elif len(self.chunk_to_send) > 0 and self.chunk_seq <= self.snd_nxt:
+              
+          
                 chunk_seq = -1
                 for chunk_seq in range(self.chunk_seq, self.total_chunk_num):
                     if chunk_seq in self.chunk_to_send:
@@ -223,17 +227,16 @@ class PingPongFlow(Flow):
                     chunk_seq, _ = self.chunk_to_send.popitem(last=False)
 
                 self.chunk_seq = chunk_seq + 1
-
+               
             elif self.total_chunk_num is None:
                 print('undefined impl!')
                 raise ValueError
-            else:
+            else:             
                 chunk_seq = None
 
-            if chunk_seq is not None:
+            if chunk_seq is not None:             
                 e, _ = self.send_ping(chunk_seq)
                 new_events.append(e)
-                #print('debug---zz sent', chunk_seq)
 
         e = Event(cur_time + self.get_sending_interval(), self, "on_ping_sent")
         new_events.append(e)
@@ -243,7 +246,6 @@ class PingPongFlow(Flow):
         return True
 
     def on_pkt_received(self, pkt):
-        # print('#szx flow_choose,on_pkt_received', pkt.pkt_type)
         new_events = super().on_pkt_received(pkt)
 
         if pkt.pkt_type == self.PONG_PKT_TYPE or pkt.pkt_type == self.ACEN_PKT_TYPE:
@@ -255,31 +257,47 @@ class PingPongFlow(Flow):
 
 
     def change_ping_to_pong(self, pkt):
-        print('#szx change_ping_to_pong', pkt)
+        cur_time = self.get_cur_time()
+        new_pkt = Packet(sent_time=cur_time,
+                     priority=pkt.priority,
+                     pkt_type=self.PONG_PKT_TYPE,
+                     size_in_bits=self.PONG_PKT_SIZE_IN_BITS,
+                     flow=pkt.flow,
+                     ecn=Packet.ECT,
+                     path=pkt.flow.reversed_path,
+        )
 
-        pkt.pkt_type = self.PONG_PKT_TYPE
-        pkt.size_in_bits = self.PONG_PKT_SIZE_IN_BITS
+        new_pkt.ping_path = pkt.path
+        new_pkt.ping_hop_cnt = pkt.hop_cnt
 
-        pkt.ping_path = pkt.path
-        pkt.ping_hop_cnt = pkt.hop_cnt
+        new_pkt.ping_seq = pkt.ping_seq
+        new_pkt.chunk_seq = pkt.chunk_seq
 
-        pkt.path = self.reversed_path
-        pkt.hop_cnt = 0
-
+        new_pkt.hop_cnt = 0
         # deal with ecn flags
         #self.receiver_deal_with_ce(pkt)
 
         #if self.check_completed(self.received_chunks):
         #    return []
-        return pkt
+        return new_pkt
     
     def change_ping_to_cwd(self, pkt,Ssum):
-        print('#szx change_ping_to_cwd', pkt)
-
-        pkt.pkt_type = self.CWD_PKT_TYPE
-        pkt.size_in_bits = self.CWD_PKT_SIZE_IN_BITS
-        pkt.Ssum = Ssum
-        return pkt
+    
+        cur_time = self.get_cur_time()
+        new_pkt = Packet(sent_time=cur_time,
+                priority=pkt.priority,
+                pkt_type=self.CWD_PKT_TYPE,
+                size_in_bits=self.CWD_PKT_SIZE_IN_BITS,
+                flow=pkt.flow,
+                ecn=Packet.ECT,
+                path=pkt.path,
+                
+        )
+        new_pkt.Ssum = Ssum
+        new_pkt.hop_cnt=pkt.hop_cnt
+        new_pkt.ping_seq = pkt.ping_seq
+        new_pkt.chunk_seq = pkt.chunk_seq
+        return new_pkt
 
  
 
@@ -287,7 +305,7 @@ class PingPongFlow(Flow):
         pass
 
     def update_est_rtt(self, sample_rtt):
-        # print('#szx update_est_rtt',self, sample_rtt)
+    
         if self.est_rtt is None:
             self.est_rtt = sample_rtt
         else:
@@ -323,6 +341,7 @@ class PingPongFlow(Flow):
             del self.completed_chunks[self.completed_chunk_offset]  # 清理偏移量对应的完成记录
             self.completed_chunk_offset += 1  # 移动偏移量
     def update_awd(self):
+        print("szx update awd")
         self.received_pkt_AECN_rtt += 1
         aecn_ratio = self.received_pkt_AECN_rtt / self.sent_pkt_rtt
         self.awd_beta = aecn_ratio * self.factors + self.awd_beta* (1 - self.factors)
@@ -336,20 +355,22 @@ class PingPongFlow(Flow):
         self.Pmax = self.awd/self.Pavg
 
     def on_pong_received(self, pkt):
-        print('#szx on_pong_received', pkt)
         self.received_pong += 1
-
+        self.received_pkt_rtt += self.PONG_PKT_SIZE_IN_BITS
+        
         if self.state != self.ONLINE:
             return []
 
         self.received_pong_from_last_timeout += 1
-        self.last_pong_received_seq = pkt.chunk_seq
+       
         self.update_P()
 
         cur_time = self.get_cur_time()
         self.last_pong_received_time = cur_time
-        sample_rtt = cur_time - pkt.sent_time
+        sample_rtt = cur_time - self.send_times[pkt.chunk_seq]
         self.update_est_rtt(sample_rtt)
+        self.sent_pkt_rtt = (self.sent_pkt_rtt*self.PING_PKT_SIZE_IN_BITS)/sample_rtt
+        self.received_pkt_rtt = self.received_pkt_rtt/sample_rtt
         new_chunk_seq = getattr(pkt, 'new_chunk_seq', -1)
         # Newly added
         self.relocated_chunk_seq = new_chunk_seq
@@ -396,6 +417,7 @@ class PingPongFlow(Flow):
             self.received_pkt_ecn_rtt += 1
 
         if self.cc_state == self.CC_STATE_CONGESTION_AVOIDANCE:
+            print("szx flow congestion avoidance")
             if pkt.ecn == pkt.CE:
                 self.received_pkt_ce_rtt += 1
                 if cur_time > self.last_ssthresh_update_time + self.est_rtt:
@@ -407,9 +429,11 @@ class PingPongFlow(Flow):
                     cwnd = max(1, self.cwnd *(1-self.cwd_alpha/2))
                     self.ssthresh = cwnd
                     self.update_cwnd(cwnd)
+                    self.gen_stat()
                
             else:
                 self.update_cwnd(self.cwnd + 1. / self.cwnd)
+                self.gen_stat()
 
         elif self.cc_state == self.CC_STATE_SLOW_START:
             if pkt.ecn == pkt.CE:
@@ -423,29 +447,31 @@ class PingPongFlow(Flow):
                 self.cwd_alpha = self.cwd_alpha**(1-self.P/self.Pmax)
                 cwnd = max(1, self.cwnd *(1-self.cwd_alpha/2))
                 self.ssthresh = cwnd
-                self.update_cwnd(cwnd)      
+                self.update_cwnd(cwnd)
+                self.gen_stat()      
             else:
                 # stay in slow start
                 self.update_cwnd(self.cwnd + 1)
+                self.gen_stat()
         else:
             print('# error!')
             raise ValueError
 
 
-        if(pkt.type == self.ACEN_PKT_TYPE):
+        if(pkt.pkt_type == self.ACEN_PKT_TYPE):
             self.update_awd(pkt.aecn_ratio)
         self.sent_pkt_rtt = 0
         self.received_pkt_AECN_rtt = 0
         self.received_pkt_ce_rtt = 0
         self.received_pkt_ecn_rtt = 0
         self.received_pkt_rtt = 0
+        self.last_pong_received_seq = pkt.chunk_seq
         self.snd_nxt = min(self.last_cwd_received_seq+self.cwnd,self.last_pong_received_seq+ self.awd)
         return []
     
     def on_cwd_received(self, pkt):
-        print('#szx on_cwd_received', self.cwnd)
         self.received_cwd += 1
-        self.received_pkt_rtt +=1
+        self.received_pkt_rtt +=self.CWD_PKT_SIZE_IN_BITS
         self.last_cwd_received_seq = pkt.chunk_seq
 
         if(pkt.ecn == pkt.ECT):
@@ -463,14 +489,14 @@ class PingPongFlow(Flow):
         self.cwnd += 1
         self.update_cwnd( self.cwnd + 1)
         self.Ssum = pkt.Ssum
-        self.update_P()
+        self.Ssavg = self.Ssum / DeviceNum
         self.snd_nxt = min(self.last_cwd_received_seq+self.cwnd,self.last_pong_received_seq+ self.awd)
         return new_events
     
     def update_cwnd(self, new_cwnd):
-        # print('#szx update_cwnd', self, new_cwnd)
+       
         self.cwnd = max(self.min_cwnd, min(self.max_cwnd, new_cwnd))
-        self.gen_stat()
+     
 
     def on_pkt_lost(self, reason, pkt=None):
         super().on_pkt_lost(reason, pkt)
@@ -481,42 +507,29 @@ class PingPongFlow(Flow):
 
     def gen_stat(self):
         cur_time = self.get_cur_time()
-        if self.est_rtt is not None:
-            stat = dict(
-                ssthresh=self.ssthresh,
-                cwnd=self.cwnd,
-                rtt=self.est_rtt,
-                #rate=self.rate_pps,
-                rate_pps = self.cwnd / self.est_rtt, 
-                ping_seq=self.ping_seq,
-                chunk_seq=self.chunk_seq,
-                ping_yet_unpong=len(self.ping_yet_unpong),
-                sent_ping=self.sent_ping,
-                sent_pong=self.sent_pong,
-                received_ping=self.received_ping,
-                received_pong=self.received_pong,
-                #lost=self.total_lost,
-                relocated_chunk_seq=self.relocated_chunk_seq,
-                pong_path_len=self.pong_path_len,
-            )
-        else: 
-            stat = dict(
-                ssthresh=self.ssthresh,
-                cwnd=self.cwnd,
-                rtt=self.est_rtt,
-                #rate=self.rate_pps,
-                rate_pps = self.cwnd / inst.ideal_rtt,
-                ping_seq=self.ping_seq,
-                chunk_seq=self.chunk_seq,
-                ping_yet_unpong=len(self.ping_yet_unpong),
-                sent_ping=self.sent_ping,
-                sent_pong=self.sent_pong,
-                received_ping=self.received_ping,
-                received_pong=self.received_pong,
-                #lost=self.total_lost,
-                relocated_chunk_seq=self.relocated_chunk_seq,
-                # pong_path_len=self.pong_path_len,
-            )
+
+        stat = dict(
+            ssthresh=self.ssthresh,
+            cwnd=self.cwnd,
+            rtt=self.est_rtt,
+            #rate=self.rate_pps,
+            rate_pps = self.cwnd / inst.ideal_rtt,
+            ping_seq=self.ping_seq,
+            chunk_seq=self.chunk_seq,
+            ping_yet_unpong=len(self.ping_yet_unpong),
+            sent_ping=self.sent_ping,
+            sent_pong=self.sent_pong,
+            received_ping=self.received_ping,
+            received_pong=self.received_pong,
+            awd = self.awd,
+            snd_nxt = self.snd_nxt,
+            cc_state=self.cc_state,
+            sent_pkt_rtt = self.sent_pkt_rtt,
+            received_pkt_rtt = self.received_pkt_rtt,
+            cwd_alpha = self.cwd_alpha,
+            aecn_ratio = self.aecn_ratio,
+            rate_bps = self.rate_bps,
+        )
             
         for reason in self.lost_reason:
             key = 'lost_{0}'.format(reason)
@@ -563,7 +576,7 @@ class MDPCache(object):
         if job_id not in self.last_gradient_seq:
             self.last_gradient_seq[job_id] = {}
 
-        # 如果worker的序列号已存在，则更新它
+       
         if flow_id not in self.last_gradient_seq[job_id]:
             self.last_gradient_seq[job_id][flow_id] = chunk_id
         else:
@@ -639,7 +652,7 @@ class EdgeBox(Middlebox):
             self,
             mdp_cache_algorithm=None,
             mup_cache_algorithm=None,
-            max_mdp_cache_size=1e6,  # 1GB
+            max_mdp_cache_size=1e6,  
             max_mup_cache_size=1e6,
             mup_timeout=10,
             enabled=True,
@@ -695,7 +708,6 @@ class EdgeBox(Middlebox):
             pkts = self.nfs[pkt.flow.TYPE](pkt)
         for pkt in pkts:
             self.perf_metrics['sent'][pkt.pkt_type] = self.perf_metrics['sent'].get(pkt.pkt_type, 0) + 1
-        print('#szx edg process')
         return pkts
 
     def change_ping_to_pong(self, pkt):
@@ -745,13 +757,6 @@ class EdgeBox(Middlebox):
 
         return new_events
 
-
-    # def add_aggregated_to_send_queue(self, chunk_key, chunk=None, reason=None):
-    #     print('#szx add_aggregated_to_send_queue', chunk_key, chunk, reason)
-    #     job_id, chunk_id = chunk_key
-    #     f = self.ebmup_flows[job_id]
-    #     f.add_to_ping_queue(chunk_id, chunk)
-
     def process_mup(self, pkt):
         #return pkt
         #处理 MUP 类型数据包。与 MDP 类似，根据数据包类型进行处理
@@ -767,8 +772,9 @@ class EdgeBox(Middlebox):
             if flow_id not in self.mup_cache_meta.get(chunk_key, []):
                 # ignore duplicated packet
                 self.mup_cache_meta.setdefault(chunk_key, set()).add(flow_id)
-                Ssum = self.mup_cache.update_gradient_seq(self,job_id, pkt.chunk_seq)
+                Ssum = self.mup_cache.update_gradient_seq(job_id,flow_id, pkt.chunk_seq)
                 pkt1 = self.change_ping_to_cwd(pkt,Ssum)
+
                 pkts.append(pkt1)
 
                 if not self.mup_cache.has_cache(job_id, pkt.chunk_seq):
@@ -783,24 +789,37 @@ class EdgeBox(Middlebox):
                     # self.add_aggregated_to_send_queue(chunk_key=chunk_key, reason='completed')
                     pkt2 = self.change_ping_to_pong(pkt)
                     pkts.append(pkt2)
-                elif len(self.mup_cache) > self.max_mup_cache_size:
-                    # remove oldest in case of overflow
-                    k, _ = self.mup_cache.popitem(last=False)
-                    # self.add_aggregated_to_send_queue(chunk_key=k, reason='overflow')
-                    pkt2 = self.change_ping_to_pong(pkt)
-                    pkts.append(pkt2)
-
+                #TODO
+                # elif len(self.mup_cache) > self.max_mup_cache_size:
+                    # # remove oldest in case of overflow
+                    # k, _ = self.mup_cache.popitem(last=False)
+                    
+                    # # self.add_aggregated_to_send_queue(chunk_key=k, reason='overflow')
+                    # pkt2 = copy.deepcopy(self.change_ping_to_pong(pkt))
+                    # pkts.append(pkt2)
         elif pkt.pkt_type == MUP.PONG_PKT_TYPE:
-
-            if len(self.mup_cache.data_flat) > inst.Eta*(max_mdp_cache_size+(inst.bw_bps*inst.ideal_rtt*DeviceNum)/MUP.PING_PKT_SIZE_IN_BITS):
+            line = inst.Eta*(max_mup_cache_size+(inst.bw_bps*inst.ideal_rtt*DeviceNum)/MUP.PING_PKT_SIZE_IN_BITS)
+            print("SZX ACEN line:",line)
+            if len(self.mup_cache.data_flat) >line :
+               print("SZX acen happened")
                pkt.pkt_type = MUP.ACEN_PKT_TYPE
            
             flows_for_job_i = [f for f in inst.flows if f.job_id == pkt.flow.job_id]
             for flow in flows_for_job_i:
-                    print(f"Flow for Job {pkt.flow.job_id}: {flow}")
-                    new_packet = copy.deepcopy(pkt)
-                    new_packet.path = flow.reversed_path  # 更改每个新实例的 path
-                    pkts.append(pkt)
+                    new_pkt = Packet(sent_time=cur_time,
+                                priority=pkt.priority,
+                                pkt_type=pkt.pkt_type,
+                                size_in_bits=pkt.size_in_bits,
+                                flow=flow,
+                                ecn=pkt.ecn,
+                                path=flow.reversed_path,
+                    )
+                    new_pkt.ping_path = pkt.path
+                    new_pkt.ping_hop_cnt = pkt.hop_cnt
+                    new_pkt.ping_seq = pkt.ping_seq
+                    new_pkt.chunk_seq = pkt.chunk_seq
+                    new_pkt.hop_cnt = pkt.hop_cnt
+                    pkts.append(new_pkt)
         else:
             raise ValueError
         return pkts
@@ -828,7 +847,7 @@ def show():
         #plt.legend()#(loc='best')
         plt.tight_layout()
         #plt.savefig('t{0}.pdf'.format(name))
-
+    plt.tight_layout()
     plt.show()
 
 
@@ -925,43 +944,51 @@ class Demo(object):
         self.net.run()
 
 
-
-    def plot(self):#这段代码定义了一个用于绘制网络流量统计数据的 plot 方法。
-        #print(self.stat)
+    def plot(self):
         spec_set = set()
         ax_dict = {}
         output = {}
         plot_data = {}
+        
+        # 收集每个 flow 的数据
         for f in self.flows:
             print('flow', f.id, 'sent_ping', f.sent_ping, 'received_ping', f.received_ping, 'sent_pong', f.sent_pong, 'received_pong', f.received_pong)
-
             print('drop stat', f.lost_reason)
             print('expired time', f.expired_time)
 
-            for t, stat in f.stats:  # f.stats是有元组构成的数组，t为时间，stat为流的状态（一个字典，通过get_stat()得到）
-                for k, v in stat.items():  # 设置键k对应的值为v.遍历状态字典中的每个键值对
-                    if k not in plot_data:#stat 是一个字典，包含流在时间点 t 的各种状态信息（如吞吐量、延迟等）。
+            for t, stat in f.stats:  # f.stats是一个元组构成的数组，t为时间，stat为流的状态（一个字典）
+                for k, v in stat.items():  # 遍历状态字典中的每个键值对
+                    if k not in plot_data:
                         plot_data[k] = {}
                     if f.id not in plot_data[k]:
                         plot_data[k][f.id] = []
                     if isinstance(v, list):
                         plot_data[k][f.id].extend(v)
-                        spec_set.add(k)#用于记录特殊统计项（即值为列表类型的项）。此类项没有时间信息，直接保存为原始值列表。
-                    else:  # 只有数值得属性需要添加时间信息
+                        spec_set.add(k)
+                    else:  # 只有数值型的属性需要添加时间信息
                         plot_data[k][f.id].append((t, v))
-        for k in plot_data:#绘图，每个统计项 k 生成一张单独的图。
-            #if 'ecn' in k:
-            #    continue
-            #if k not in spec_set:
-            ax = mkAXS()
-            ax.set_title(k)
-            for fid in plot_data[k]:
+
+        # 创建一个单独的图，或者根据需要的子图数量动态分配
+        for k in plot_data:
+            # 为每个 flow 创建独立的子图
+            fig, ax = plt.subplots(len(plot_data[k]), 1, figsize=(10, 6 * len(plot_data[k])))  # 创建多行子图，每个flow一个子图
+            fig.suptitle(k, fontsize=16)  # 设置每个图的标题为统计项 k
+            if len(plot_data[k]) == 1:  # 如果只有一个flow，ax 会是一个单一的坐标轴对象
+                ax = [ax]
+            
+            # 对每个 flow 分别绘图
+            for idx, (fid, data) in enumerate(plot_data[k].items()):
                 x, y = [], []  # x为时间，y为数值
-                for xx, yy in plot_data[k][fid]:
+                for xx, yy in data:
                     x.append(xx)
                     y.append(yy)
-                ax.errorbar(x=x, y=y, label='flow {0}'.format(fid))
-            ax.legend()
+                ax[idx].errorbar(x=x, y=y, label='flow {0}'.format(fid))
+                ax[idx].set_xlabel('时间 (秒)')
+                ax[idx].set_ylabel(k)
+                ax[idx].legend()
+
+        plt.tight_layout()
+        plt.show()
 
 
 def convert_to_rate(xy, stepsize=10):#该函数 convert_to_rate 的作用是将累积量数据转换为速率数据，适用于分析随时间累积的统计数据（例如流量、计数器值等）。
@@ -977,19 +1004,27 @@ def convert_to_rate(xy, stepsize=10):#该函数 convert_to_rate 的作用是将�
     return x, y
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--num', type=int, required=True, default=0,help='gradient_num')
+
+    # 解析命令行参数
+    args = parser.parse_args()
+
     for FCLS in (MUP, ):  #MUP
-        gradient_num = 1
+        gradient_num = args.num
         #a = 0.1
         max_mdp_cache_size = 1e4
+        max_mup_cache_size=1e4
         DeviceNum = 2
         for relocation_enabled in (True, False)[:1]:
             inst = Demo(
                 DeviceNum=DeviceNum,
                 JobNum=1,
                 FCLS=FCLS,
-                MODEL_SIZE_IN_CHUNK=gradient_num,
+                MODEL_SIZE_IN_CHUNK=gradient_num + 1,#加1是因为代码原因
                 max_mdp_cache_size=max_mdp_cache_size,
-                max_mup_cache_size=1e4,
+                max_mup_cache_size=max_mup_cache_size,
                 enabled_box=True,  #enabled_box,
                 relocation_enabled=relocation_enabled,
                 start_times=[0, 1, 20, 0.2])

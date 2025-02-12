@@ -176,11 +176,15 @@ class Qdisc(QdiscBase):##定义了网络中的排队规则，支持多种不同�
             q.avg_qlenr = (1 - wq) * q.avg_qlenr + wq *  q.total_pkt_size_in_bits / q.size_bits
             q.empty_start_time = None
 
+        print("SZX q.avg_qlenr", q.avg_qlenr)
+        print("SZX RedConfig['MaxTh_r']", RedConfig['MaxTh_r'])
+        print("SZX RedConfig['MinTh_r']", RedConfig['MinTh_r'])
         if  q.avg_qlenr >= RedConfig['MaxTh_r']:
             pkt.drop(pkt.DROP_CAUSED_BY_CONGESTION)
             q.count = 0
             return False
         elif q.avg_qlenr > self.RedConfigs[p]['MinTh_r']:
+            print("SZX CONGESTION")
             if RedConfig.get('UseEcn', False) and pkt.ecn == pkt.ECT:
                 pkt.ecn = pkt.CE
             
@@ -393,7 +397,7 @@ class Link(EnvObject):##表示网络中的链路，负责包的发送、接收�
         return new_events
 
     def on_pkt_received(self, pkt):
-        print("szx on_pkt_received link")
+
         pkt.hop()
 
         cur_time = self.get_cur_time()
@@ -404,6 +408,7 @@ class Link(EnvObject):##表示网络中的链路，负责包的发送、接收�
                 self.unscheduled = False
                 next_pkt = self.qdisc.get_next_pkt()
                 t = self.get_next_sending_interval(next_pkt.size_in_bits)
+             
                 e = Event(cur_time + t, self, 'on_pkt_sent')
                 new_events.append(e)
         return new_events
@@ -460,19 +465,9 @@ class Environment(object):##定义模拟环境，管理事件队列，并调度�
             if len(self.events) == 0:
                 break
             e = heapq.heappop(self.events)
-
-            # 打印当前事件队列的状态
-            # print(f"Current length of events queue: {len(self.events)}")
-            # print(f"Inserting event: {e}, Event time: {e.t}, Event name: {e.name}")
-            
             assert e.t >= self.cur_time
             self.cur_time = e.t
-
-            # # 打印事件插入前后的队列状态
-            # print(f"Before inserting event, events queue length: {len(self.events)}")
-            # for event in self.events:
-            #     print(f"Event time: {event.t}, Event name: {event.name}")
-
+       
             new_events = e.exec()
             for e in new_events:
                 heapq.heappush(self.events, e)
@@ -502,7 +497,7 @@ class Middlebox(EnvObject):##提供了一个Middlebox类，可以自定义处理
         self.id = Middlebox._get_next_id()
 
     def on_pkt_received(self, pkt):
-        print("szx on_pkt_received middlebox")
+
         pkt.hop()
         pkts = self.process(pkt)
 
@@ -510,6 +505,7 @@ class Middlebox(EnvObject):##提供了一个Middlebox类，可以自定义处理
         events = []
 
         for pkt in pkts:
+          
             obj = pkt.get_next_hop()
             e = Event(cur_time, obj, 'on_pkt_received', params=dict(pkt=pkt))
             events.append(e)
@@ -555,9 +551,11 @@ class Packet(object):##表示网络中的数据包，包含优先级、大小和
         self.Ssum = 0
 
     def hop(self):
+     
         self.hop_cnt += 1
 
     def get_next_hop(self):
+      
         if self.hop_cnt >= len(self.path):
             print('error', self.hop_cnt, self.path)
             raise ValueError
@@ -674,7 +672,7 @@ class Flow(EnvObject):##表示网络中的数据流。
         return self.priority
 
     def on_pkt_received(self, pkt):
-        # print("szx on_pkt_received flow")
+       
         pkt.hop()
         return []
 
