@@ -175,10 +175,8 @@ class Qdisc(QdiscBase):##定义了网络中的排队规则，支持多种不同�
         else:
             q.avg_qlenr = (1 - wq) * q.avg_qlenr + wq *  q.total_pkt_size_in_bits / q.size_bits
             q.empty_start_time = None
-
-        print("SZX q.avg_qlenr", q.avg_qlenr)
-        print("SZX RedConfig['MaxTh_r']", RedConfig['MaxTh_r'])
-        print("SZX RedConfig['MinTh_r']", RedConfig['MinTh_r'])
+        if(q.avg_qlenr > 0):
+            print("SZX q.avg_qlenr", q.avg_qlenr)
         if  q.avg_qlenr >= RedConfig['MaxTh_r']:
             pkt.drop(pkt.DROP_CAUSED_BY_CONGESTION)
             q.count = 0
@@ -652,7 +650,7 @@ class Flow(EnvObject):##表示网络中的数据流。
         self.reversed_path.append(self)#PAATP中指的是ACKpath
 
 
-        self.default_pkt_size_in_bits = params.get('pkt_size_in_bits', 8e3)
+        self.default_pkt_size_in_bits = params.get('pkt_size_in_bits', 2400)
 
         self.params = params
         

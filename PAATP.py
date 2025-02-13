@@ -9,6 +9,8 @@ from collections import OrderedDict
 
 parser = argparse.ArgumentParser(description='hello.')
 parser.add_argument('--init-sending-rate-pps', type=int, default=10)
+parser.add_argument('--num', type=int, required=False, default=0,help='gradient_num')
+parser.add_argument('--jobnum', type=int, required=False, default=0,help='jobnum')
 args = parser.parse_args()
 
 
@@ -30,9 +32,9 @@ class PingPongFlow(Flow):
     CWD_PKT_TYPE = 'CWD'
     ACEN_PKT_TYPE = 'ACEN'
 
-    PING_PKT_SIZE_IN_BITS = 2
-    PONG_PKT_SIZE_IN_BITS = 8 * 1024
-    CWD_PKT_SIZE_IN_BITS = 2
+    PING_PKT_SIZE_IN_BITS = 2400 #300bytes
+    PONG_PKT_SIZE_IN_BITS = 2400 #300bytes
+    CWD_PKT_SIZE_IN_BITS = 496 #62bytes
     ACEN_PKT_SIZE_IN_BITS = PONG_PKT_SIZE_IN_BITS
 
     DUPLICATED_PONG_THRESHOLD = 3
@@ -41,7 +43,7 @@ class PingPongFlow(Flow):
         super().start()
         self.job_id = self.params.get('job_id', 0)
 
-        self.rate_bps = self.params.get('nic_rate_bps', 2e8)
+        self.rate_bps = self.params.get('nic_rate_bps', 2e8)#23.84MBps
         #self.sending_interval_var = 0.2
         self.cwnd = self.params.get('init_cwnd', 5)
         self.awd = self.params.get('awd', 15)
@@ -196,7 +198,7 @@ class PingPongFlow(Flow):
         self.ping_yet_unpong[pkt.chunk_seq] = pkt
         self.out_of_order_cnts[pkt.chunk_seq] = 0
 
-        obj = pkt.get_next_hop()#其实是获得当前节点而不是next_hop
+        obj = pkt.get_next_hop()
         #delay = random.random() * 0.05 * self.get_sending_interval()
         e = Event(cur_time + delay, obj, 'on_pkt_received', params=dict(pkt=pkt))
         return e, pkt
@@ -209,14 +211,11 @@ class PingPongFlow(Flow):
         if self.state != self.ONLINE:
             return new_events
 
-        if self.can_send_ping() and len(self.ping_yet_unpong) < self.cwnd :
-            if len(self.resend_queue) > 0:
-               
+        if self.can_send_ping() and len(self.ping_yet_unpong) <= self.awd:
+            if len(self.resend_queue) > 0:      
                 chunk_seq, _ = self.resend_queue.popitem(last=False)
                 print('$ debug, resend chunk_seq', chunk_seq)
             elif len(self.chunk_to_send) > 0 and self.chunk_seq <= self.snd_nxt:
-              
-          
                 chunk_seq = -1
                 for chunk_seq in range(self.chunk_seq, self.total_chunk_num):
                     if chunk_seq in self.chunk_to_send:
@@ -258,7 +257,7 @@ class PingPongFlow(Flow):
 
     def change_ping_to_pong(self, pkt):
         cur_time = self.get_cur_time()
-        new_pkt = Packet(sent_time=cur_time,
+        new_pkt = Packet(sent_time=pkt.sent_time,
                      priority=pkt.priority,
                      pkt_type=self.PONG_PKT_TYPE,
                      size_in_bits=self.PONG_PKT_SIZE_IN_BITS,
@@ -284,7 +283,7 @@ class PingPongFlow(Flow):
     def change_ping_to_cwd(self, pkt,Ssum):
     
         cur_time = self.get_cur_time()
-        new_pkt = Packet(sent_time=cur_time,
+        new_pkt = Packet(sent_time=pkt.sent_time,
                 priority=pkt.priority,
                 pkt_type=self.CWD_PKT_TYPE,
                 size_in_bits=self.CWD_PKT_SIZE_IN_BITS,
@@ -355,9 +354,16 @@ class PingPongFlow(Flow):
         self.Pmax = self.awd/self.Pavg
 
     def on_pong_received(self, pkt):
+        #一些参数变化
         self.received_pong += 1
+        self.awd = self.awd + 1
+       
         self.received_pkt_rtt += self.PONG_PKT_SIZE_IN_BITS
-        
+
+        if pkt.ecn == pkt.ECT or pkt.ecn == pkt.CE:
+            self.received_pkt_ecn_rtt += 1
+
+
         if self.state != self.ONLINE:
             return []
 
@@ -413,8 +419,6 @@ class PingPongFlow(Flow):
         if len(to_resend) > 0:
             pass
 
-        if pkt.ecn == pkt.ECT or pkt.ecn == pkt.CE:
-            self.received_pkt_ecn_rtt += 1
 
         if self.cc_state == self.CC_STATE_CONGESTION_AVOIDANCE:
             print("szx flow congestion avoidance")
@@ -472,7 +476,7 @@ class PingPongFlow(Flow):
     def on_cwd_received(self, pkt):
         self.received_cwd += 1
         self.received_pkt_rtt +=self.CWD_PKT_SIZE_IN_BITS
-        self.last_cwd_received_seq = pkt.chunk_seq
+       
 
         if(pkt.ecn == pkt.ECT):
             self.received_pkt_ecn_rtt +=1
@@ -491,6 +495,7 @@ class PingPongFlow(Flow):
         self.Ssum = pkt.Ssum
         self.Ssavg = self.Ssum / DeviceNum
         self.snd_nxt = min(self.last_cwd_received_seq+self.cwnd,self.last_pong_received_seq+ self.awd)
+        self.last_cwd_received_seq = pkt.chunk_seq
         return new_events
     
     def update_cwnd(self, new_cwnd):
@@ -529,6 +534,7 @@ class PingPongFlow(Flow):
             cwd_alpha = self.cwd_alpha,
             aecn_ratio = self.aecn_ratio,
             rate_bps = self.rate_bps,
+            Progress = self.P,
         )
             
         for reason in self.lost_reason:
@@ -553,10 +559,10 @@ class MUP(PingPongFlow):
     CWD_PKT_TYPE = 'MUP_CWD'
     ACEN_PKT_TYPE = 'MUP_ACEN'
 
-    PING_PKT_SIZE_IN_BITS = 2
-    PONG_PKT_SIZE_IN_BITS = 8 * 1024
-    CWD_PKT_SIZE_IN_BITS = 2
-    ACEN_PKT_SIZE_IN_BITS = 8 * 1024
+    PING_PKT_SIZE_IN_BITS = 2400 #300bytes
+    PONG_PKT_SIZE_IN_BITS = 2400 #300bytes
+    CWD_PKT_SIZE_IN_BITS = 496 #62bytes
+    ACEN_PKT_SIZE_IN_BITS = PONG_PKT_SIZE_IN_BITS
 
 
 
@@ -588,8 +594,7 @@ class MDPCache(object):
         self.Ssum[job_id] = sum(self.last_gradient_seq[job_id].values())
 
         # 输出当前更新信息
-        print(f"Job {job_id}, Worker {flow_id}: Last Gradient Seq Updated to {self.last_gradient_seq[job_id][flow_id]}")
-        print(f"Current Ssum for Job {job_id}: {self.Ssum[job_id]}")
+
         return self.Ssum[job_id]
     
 
@@ -668,7 +673,7 @@ class EdgeBox(Middlebox):
             total={},
             detail={},
         )
-        self.mup_cache = MDPCache(max_mdp_cache_size) 
+        self.mup_cache = MDPCache(max_mup_cache_size) 
         self.mup_cache_meta = {}
         self.mup_perf_metrics = dict(
             total=0,
@@ -798,8 +803,9 @@ class EdgeBox(Middlebox):
                     # pkt2 = copy.deepcopy(self.change_ping_to_pong(pkt))
                     # pkts.append(pkt2)
         elif pkt.pkt_type == MUP.PONG_PKT_TYPE:
-            line = inst.Eta*(max_mup_cache_size+(inst.bw_bps*inst.ideal_rtt*DeviceNum)/MUP.PING_PKT_SIZE_IN_BITS)
-            print("SZX ACEN line:",line)
+            line = inst.Eta*inst.M_and_BDP
+          
+
             if len(self.mup_cache.data_flat) >line :
                print("SZX acen happened")
                pkt.pkt_type = MUP.ACEN_PKT_TYPE
@@ -809,7 +815,7 @@ class EdgeBox(Middlebox):
                     new_pkt = Packet(sent_time=cur_time,
                                 priority=pkt.priority,
                                 pkt_type=pkt.pkt_type,
-                                size_in_bits=pkt.size_in_bits,
+                                size_in_bits=MUP.ACEN_PKT_SIZE_IN_BITS,
                                 flow=flow,
                                 ecn=pkt.ecn,
                                 path=flow.reversed_path,
@@ -857,8 +863,9 @@ def mkAXS(key=0):
     return ax
 
 class Demo(object):
+    max_mup_cache_size = 40000
     def __init__(self,
-                 DeviceNum=2,
+                 DeviceNum=1,
                  JobNum=1,
                  bw_bps=80e6,
                  lat=1e-2,##链路延迟，单位为秒。
@@ -866,7 +873,7 @@ class Demo(object):
                  FCLS=MUP,
                  MODEL_SIZE_IN_CHUNK=50e3,##模型大小，用于设置总数据包数
                  max_mdp_cache_size=1e4,#缓存大小。
-                 max_mup_cache_size=1e4,##缓存大小。
+                 max_mup_cache_size=max_mup_cache_size,##缓存大小。
                  enabled_box=True,#是否启用 EdgeBox（边缘设备）。
                  relocation_enabled=False,#
                  queue_lambda=1.,
@@ -883,11 +890,17 @@ class Demo(object):
         qsize_in_bits = bdp_in_bits * 4
 
         max_cwnd = qsize_in_bits * 2 / 8 / BYTES_PER_PACKET
-              
-        self.Eta = 1-(((bw_bps*ideal_rtt)/MUP.PING_PKT_SIZE_IN_BITS+JobNum)/
-                      ((bw_bps*ideal_rtt*DeviceNum)/MUP.PING_PKT_SIZE_IN_BITS+max_mup_cache_size))
-        print("max_cwnd:",max_cwnd)
+        
+        self.CA_and_N = ((bw_bps*ideal_rtt)/MUP.PING_PKT_SIZE_IN_BITS)*JobNum+JobNum
+        self.M_and_BDP = max_mup_cache_size + (bw_bps*ideal_rtt*DeviceNum)/MUP.PING_PKT_SIZE_IN_BITS
+        self.Eta = 1-self.CA_and_N/self.M_and_BDP
+        line = self.Eta*(max_mup_cache_size+(self.bw_bps*self.ideal_rtt*DeviceNum)/MUP.PING_PKT_SIZE_IN_BITS)
+        print("SZX CA_and_N:",self.CA_and_N)
+        print("SZX M_and_BDP:",self.M_and_BDP)
         print("self.Eta:",self.Eta)
+        print("SZX ACEN line:",line)
+        print("max_cwnd:",max_cwnd)
+      
 
         weights = {1: 8, 2: 4, 3: 2, 4: 1}
         mq_sizes = {i: qsize_in_bits for i in weights}
@@ -902,7 +915,7 @@ class Demo(object):
         self.boxes = [
             EdgeBox(
                 jobs_config=mup_jobs_config,
-                max_mdp_cache_size=max_mdp_cache_size,  # 1GB
+                max_mdp_cache_size=max_mdp_cache_size,  
                 max_mup_cache_size=max_mup_cache_size,
                 enabled=enabled_box,
                 relocation_enabled=relocation_enabled,
@@ -1004,23 +1017,18 @@ def convert_to_rate(xy, stepsize=10):#该函数 convert_to_rate 的作用是将�
     return x, y
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument('--num', type=int, required=True, default=0,help='gradient_num')
-
-    # 解析命令行参数
-    args = parser.parse_args()
 
     for FCLS in (MUP, ):  #MUP
         gradient_num = args.num
+        JobNum = args.jobnum
         #a = 0.1
         max_mdp_cache_size = 1e4
-        max_mup_cache_size=1e4
-        DeviceNum = 2
+        max_mup_cache_size=40000
+        DeviceNum = 1
         for relocation_enabled in (True, False)[:1]:
             inst = Demo(
                 DeviceNum=DeviceNum,
-                JobNum=1,
+                JobNum=JobNum,
                 FCLS=FCLS,
                 MODEL_SIZE_IN_CHUNK=gradient_num + 1,#加1是因为代码原因
                 max_mdp_cache_size=max_mdp_cache_size,
